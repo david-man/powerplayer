@@ -1,6 +1,5 @@
 import math
 
-import pyspiel
 import numpy as np
 import networkx as nx
 
