@@ -1,5 +1,22 @@
 import functools
 
+from gymnasium.spaces import Dict
+from ray import tune
+from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.env.wrappers.pettingzoo_env import ParallelPettingZooEnv
+from ray.rllib.examples.policy.rock_paper_scissors_dummies import AlwaysSameHeuristic, BeatLastHeuristic
+from ray.rllib.models import ModelCatalog
+from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
+from ray.rllib.policy.policy import PolicySpec
+from ray.tune.registry import register_env
+import sys
+import gymnasium
+
+
+sys.modules["gym"] = gymnasium
+from stable_baselines3 import PPO
+from torch import nn
+
 from pettingzoo.utils.env import ParallelEnv
 import math
 import random
@@ -70,7 +87,15 @@ def euclideanDistance(point_1, point_2):
 
 
 class Powerplayer(ParallelEnv):
-    def __init__(self):
+    metadata = {"name": "powerplayer", "render_modes": ["time", "debug"]}
+    def env(render_mode = None):
+        env1 = Powerplayer(render_mode = render_mode)
+        env1 = parallel_to_aec(env1)
+        env1 = wrappers.AssertOutOfBoundsWrapper(env1)
+        env1 = wrappers.OrderEnforcingWrapper(env1)
+
+        return env1
+    def __init__(self, render_mode = None):
         self.junctions = np.zeros((29,))# includes terminals, will include a picture of what junction is where later. self.junctions stores the current owner of the junction(0 = nobody, 1 = red, -1 = blue)
         #constnts about the locations of key areas
         self.terminals = [0,1,2,3]
@@ -80,8 +105,11 @@ class Powerplayer(ParallelEnv):
         self.high_junctions = [11, 15, 17, 21]
         self.red_cone_areas = [3, 17, 23, 33]
         self.blue_cone_areas = [2, 12, 18, 32]
-
+        self.render_mode = render_mode
         self.order = None
+
+
+
         
         self.blue_points = None
         self.red_points = None
@@ -99,11 +127,13 @@ class Powerplayer(ParallelEnv):
         self.blue_terminal_one = None
         self.red_terminal_two = None
         self.blue_terminal_two = None
-        self.adjustmentPeriods = [None,None,None,None]
+        self.adjustmentPeriods = [None,None,None,None]#defines the amount of time the bot needs to adjust BEFORE placing. DOES NOT include placement, which takes 0.5 seconds by definition
         self.actions = {"red_1": None, "red_2": None, "blue_1": None, "blue_2": None}# -1: currently busy, actor isn't choosing anything,
                                             # 0: cone or beacon,
                                             # 1: junction choice
-        self.action_spaces = {"red_1": Discrete(1), "red_2": Discrete(1), "blue_1": Discrete(1), "blue_2": Discrete(1)}
+        self.action_spaces = {"red_1": Discrete(29), "red_2": Discrete(29), "blue_1": Discrete(29), "blue_2": Discrete(29)}
+        self.action_masks = {"red_1": np.ones(29, dtype=np.int64), "red_2": np.ones(29, dtype=np.int64), "blue_1": np.ones(29, dtype=np.int64), "blue_2": np.ones(29, dtype=np.int64)}
+
 
         self.bots = {
             "red_1": {"x": None, "y": None, "heading": None, "holdingCone": False, "holdingBeacon": False, "path": None,
@@ -131,9 +161,12 @@ class Powerplayer(ParallelEnv):
             if(col<5):
                 self.graph.add_edge(col, col+1)
         self.possible_agents = ["red_1", "red_2", "blue_1", "blue_2"]
-        
-    
-    def reset(self, seed = None,  return_info = False, options = None):
+        self.observation_spaces = {a : Dict({"observation": MultiDiscrete(
+            [3] * 29 + [242, 11, 2, 30, 7, 6, 6, 4, 2, 2, 6, 6, 4, 2, 2, 6, 6, 4, 2, 2, 6, 6, 4, 2, 2, 40, 40, 25, 25,
+                        25, 25, 21, 21, 6, 6, 6, 6, 2, 2, 2, 2], dtype=np.int64), "action_mask": MultiDiscrete([2] * 29, dtype=np.int64)})for a in self.possible_agents}
+
+
+    def reset(self, seed = 0,  return_info = False, options = None):
         self.agents = copy(self.possible_agents)
         self.blue_points = 0
         self.red_points = 0
@@ -151,14 +184,15 @@ class Powerplayer(ParallelEnv):
         self.blue_terminal_one = False
         self.red_terminal_two = False
         self.blue_terminal_two = False
-        self.adjustmentPeriods = {"red_1": 2, "red_2":2, "blue_1": 2,"blue_2":2}
+        self.adjustmentPeriods = {"red_1": 2, "red_2":2, "blue_1": 2,"blue_2":2}# 2s for all bots to adjust BEFORE placing cone down
         self.actions = {"red_1": -1, "red_2":-1, "blue_1": -1,"blue_2":-1}
         self.order = ["red_1", "red_2", "blue_1", "blue_2"]
+        self.rendered = False
         if(seed is not None):
             random.seed(seed)
             random.shuffle(self.order)
             for i in range(4):
-                self.adjustmentPeriods[i] = random.randint(2,7)*0.5
+                self.adjustmentPeriods[i] = random.randint(1,6)*0.5
 
 
         self.bots = {
@@ -175,11 +209,12 @@ class Powerplayer(ParallelEnv):
              "team" : "blue", "gotBeacon":False, "junctionTo": None, "busy":0, "released": False,
              "adjustmentPeriod":self.adjustmentPeriods["blue_2"], "flagOne":True}}
 
-        self.action_spaces = {"red_1": Discrete(1), "red_2": Discrete(1), "blue_1": Discrete(1), "blue_2": Discrete(1)}
+        for a in self.agents:
+            self.set_action_space_size(a, 1)
 
         self.timeElapsed = 0
 
-        observations = {a: {"observation": self.generate_observation(a)} for a in self.agents}
+        observations = {i: self.generate_observation(i) for i in self.agents}
 
         return observations
 
@@ -206,7 +241,6 @@ class Powerplayer(ParallelEnv):
                         and (self.bots[bot]["path"][0] == coordsToBox(referal["x"], referal["y"]))):
                     toSet = 0
                     if(abs(referal["heading"] - self.bots[bot]["heading"]) == 180):#designates a head-on:
-                        self.bots[bot]["busy"] = 1
                         referal["busy"] = 1
                         toSet = 1
                         #print("Head On Collision")
@@ -261,16 +295,6 @@ class Powerplayer(ParallelEnv):
         return bestPath[1:]
     
     def step(self, actions):
-        '''
-        print(self.render())
-        '''
-
-        #print(self.timeElapsed)
-        #print(self.red_points)
-        #print(self.blue_points)
-
-        #print(self.action_spaces)
-        #print(self.actions)
         collided = {"red_1": False, "red_2": False, "blue_1": False, "blue_2": False}
         for bot in self.bots:
             collided[bot] = self.collisionCheck(bot)
@@ -280,24 +304,24 @@ class Powerplayer(ParallelEnv):
         for r in self.order:
             if(collided[r]):
                 self.actions[r] = -1
-                self.action_spaces[r] = Discrete(1)
+                self.set_action_space_size(r, 1)
                 self.bots[r]["released"] = True
                 continue
             if(self.actions[r] == 1):# says if it just chose a junction
                 if(self.bots[r]["holdingBeacon"]): actions[r]+=4
 
                 toCont = True
-                if((self.bots[r]["junctionTo"] is not None) and len(self.bots[r]["path"]) == 0):# if the bot is there
+                if((self.bots[r]["junctionTo"] is not None) and len(self.bots[r]["path"]) == 0):# if the bot is there; the 0.5s that is spent here acts as a confirmation
 
                     if (self.bots[r]["junctionTo"] > 0):
                         self.bots[r]["junctionTo"] *= -1
                         self.bots[r]["busy"] = self.bots[r]["adjustmentPeriod"] - 0.5
                         self.actions[r] = -1
-                        self.action_spaces[r] = Discrete(1)
+                        self.set_action_space_size(r, 1)
 
                     else:
                         reward = self.simulatePlacement(r, abs(self.bots[r]["junctionTo"]))
-                        self.action_spaces[r] = Discrete(1)
+                        self.set_action_space_size(r, 1)
                         self.actions[r] = -1
                         rewards[r] += reward
                     continue
@@ -308,6 +332,7 @@ class Powerplayer(ParallelEnv):
                     junction_box = -1
                     junction_distance = 100000
                     #print(str(actions[r]) + ": " + str(junction_boxes))
+                    toCont = True
                     for j in junction_boxes:
                         dist = euclideanDistance([self.bots[r]["x"], self.bots[r]["y"]], boxToCoords(j))
                         if (dist < junction_distance):
@@ -319,24 +344,30 @@ class Powerplayer(ParallelEnv):
                     self.bots[r]["path"] = self.shortestPath(coordsToBox(self.bots[r]["x"], self.bots[r]["y"]),
                                                              junction_box, 5,
                                                              self.bots[r]["heading"])
-
-                    x = self.collisionCheck(r, True)
-                    for i in x:
-                        if(not x[i] == -1 and not self.bots[i]["released"]):
-                            self.actions[r] = -1
-                            self.action_spaces[r] = Discrete(1)
-                            self.bots[r]["released"] = True
-                            toCont = False
-                            if(not x[i] == 0):
-                                self.actions[i] = -1
-                                self.action_spaces[i] = Discrete(1)
-                                self.bots[i]["released"] = True
-                                self.bots[i]["busy"] = x[i]
+                    if(len(self.bots[r]["path"]) == 0):# just need to handle beginning of placement, not completion
+                        self.bots[r]["junctionTo"] *= -1
+                        self.bots[r]["busy"] = self.bots[r]["adjustmentPeriod"] - 0.5
+                        self.actions[r] = -1
+                        self.set_action_space_size(r, 1)
+                        continue
+                    else:
+                        x = self.collisionCheck(r, True)
+                        for i in x:
+                            if(not x[i] == -1 and not self.bots[i]["released"]):
+                                self.actions[r] = -1
+                                self.set_action_space_size(r, 1)
+                                self.bots[r]["released"] = True
+                                toCont = False
+                                if(not x[i] == 0):
+                                    self.actions[i] = -1
+                                    self.set_action_space_size(r, 1)
+                                    self.bots[i]["released"] = True
+                                    self.bots[i]["busy"] = x[i]
 
                 if(toCont):
                     self.simulateMovement(r)# continue on the path if it's not there yet
                     self.actions[r] = 1
-                    self.action_spaces[r] = Discrete(29) if not self.bots[r]["holdingBeacon"] else Discrete(25)
+                    self.set_action_space_size(r, 29) if not self.bots[r]["holdingBeacon"] else self.set_action_space_size(r, 25)
             elif(self.actions[r] == 0):# was it just supposed to choose a beacon/cone
                 box = coordsToBox(self.bots[r]["x"], self.bots[r]["y"])  # take one cone away from wherever
                 if (box == 3):
@@ -355,24 +386,26 @@ class Powerplayer(ParallelEnv):
                 if(actions[r] == 1):
                     self.bots[r]["holdingBeacon"] = True
                     rewards[r]+=1
-                    self.action_spaces[r] = Discrete(25)
+                    self.set_action_space_size(r, 25)
                     self.actions[r] = 1
                 else:
                     self.bots[r]["holdingCone"] = True
-                    self.action_spaces[r] = Discrete(29)
+                    self.set_action_space_size(r, 29)
                     self.actions[r] = 1# need to go to a junction next
             else: #was busy doing something else
-                if(self.bots[r]["busy"] == 0.5 and (self.bots[r]["junctionTo"] is not None and self.bots[r]["junctionTo"] < 0)):
-                    self.action_spaces[r] = Discrete(1)
+                if(self.bots[r]["busy"] <= 0.5 and (self.bots[r]["junctionTo"] is not None and self.bots[r]["junctionTo"] < 0)):
+                    # if adjustperiod = 0.5s, it will be artificially decreased to 0s due to code structure.
+                    # this means that once it gets here, it will spend the 0.5s turn to tell itself to place on the next turn, which is why it needs to be 0s
+                    self.set_action_space_size(r, 1)
                     self.actions[r] = 1
                     self.bots[r]["busy"] = 0
-                elif(self.bots[r]["busy"] == 0.5 and (self.bots[r]["holdingCone"] or self.bots[r]["holdingBeacon"])):
-                    self.action_spaces[r] = Discrete(29) if self.bots[r]["holdingCone"] else Discrete(25)
+                elif(self.bots[r]["busy"] <= 0.5 and (self.bots[r]["holdingCone"] or self.bots[r]["holdingBeacon"])):
+                    self.set_action_space_size(r, 29) if self.bots[r]["holdingCone"] else self.set_action_space_size(r, 25)
                     self.actions[r] = 1
                     self.bots[r]["busy"] = 0
                 elif(self.bots[r]["busy"] > 0):
                     self.bots[r]["busy"] -= 0.5
-                    self.action_spaces[r] = Discrete(1)
+                    self.set_action_space_size(r, 1)
                     self.actions[r] = -1
                 else:
                     # if the length of the path is 0, must be either have just finished putting down a cone or have just arrived to pick up a cone
@@ -420,30 +453,31 @@ class Powerplayer(ParallelEnv):
                                 self.bots[r]["path"] = self.shortestPath(
                                     coordsToBox(self.bots[r]["x"], self.bots[r]["y"]), box_to_go_to, 5,
                                     self.bots[r]["heading"])
+
                             else:
                                 self.bots[r]["busy"] = 10000# kills it at this point - aint no way it getting here but just a precaution
                             self.actions[r] = -1
-                            self.action_spaces[r] = Discrete(1)
+                            self.set_action_space_size(r, 1)
                         else:
                             #deal with picking up cone
                             if(self.timeElapsed >= 90 and (not self.bots[r]["gotBeacon"])):
                                 self.actions[r] = 0
-                                self.action_spaces[r] = Discrete(2)
+                                self.set_action_space_size(r, 2)
                             else:
                                 self.bots[r]["holdingCone"] = True
-                                self.action_spaces[r] = Discrete(29)
+                                self.set_action_space_size(r, 29)
                                 self.actions[r] = 1  # need to go to a junction next
 
                     else:
                         if(self.bots[r]["holdingCone"] == True):
                             self.actions[r] = 1
-                            self.action_spaces[r] = Discrete(29)
+                            self.set_action_space_size(r, 29)
                         elif(self.bots[r]["holdingBeacon"] == True):
                             self.actions[r] = 1
-                            self.action_spaces[r] = Discrete(25)
+                            self.set_action_space_size(r, 25)
                         else:
                             self.actions[r] = -1
-                            self.action_spaces[r] = Discrete(1)
+                            self.set_action_space_size(r, 1)
 
                             self.simulateMovement(r)
 
@@ -454,10 +488,10 @@ class Powerplayer(ParallelEnv):
         observations = {a : self.generate_observation(a) for a in self.agents}
         if(self.timeElapsed >= 120):
             red_p, blue_p, red_c, blue_c = self.calcFinalPoints()
-            rewards["red_1"] += red_p/10
-            rewards["red_2"] += red_p/10
-            rewards["blue_1"] += blue_p/10
-            rewards["blue_2"] += blue_p/10
+            rewards["red_1"] += red_p*3/5
+            rewards["red_2"] += red_p*3/5
+            rewards["blue_1"] += blue_p*3/5
+            rewards["blue_2"] += blue_p*3/5
 
             if(self.bots["red_1"]["adjustmentPeriod"] + self.bots["red_2"]["adjustmentPeriod"]
                     < self.bots["blue_1"]["adjustmentPeriod"] + self.bots["blue_2"]["adjustmentPeriod"]):#deals with cycle times and circuiting
@@ -678,7 +712,12 @@ class Powerplayer(ParallelEnv):
                     self.blue_beacon_two = junctionAt
             referal["gotBeacon"] = True
         if(junctionAt < 4):
-            points += 1
+            points += 1 if referal["team"] == "red" and (junctionAt == 0 or junctionAt == 35) else 0
+            points += 1 if referal["team"] == "blue" and (junctionAt==5 or junctionAt==30) else 0
+            if((junctionAt == 5 or junctionAt==30) and referal["team"] == "red"):
+                rewards -= 10#make them not go to this junction - this part of the code is a bandage on a really bad bug, but i'm too tired to fix it within the first iteration
+            elif((junctionAt == 0 or junctionAt == 35) and referal["team"] == "blue"):
+                rewards -= 10
             if((not self.red_terminal_one) and referal["team"] == "red" and junctionAt == 0):
                 self.red_terminal_one = True
                 rewards+=3
@@ -757,51 +796,313 @@ class Powerplayer(ParallelEnv):
                 int(self.red_terminal_two),
                 int(self.blue_terminal_two)
                 ]
-        return tuple(current_obs)
-    def render(self):
-        print("ACTIONS FOR FOLLOWING STATE: " + str(self.actions))
-        print("STATE OF RED_1 FOR GRAPH BELOW: " + str(self.bots["red_1"]))
-        print("STATE OF RED_2 FOR GRAPH BELOW: " + str(self.bots["red_2"]))
-        spacesNeededLeft = 2 if self.blue_substation >= 10 else 1
-        spacesNeededRight = 2 if self.red_substation >= 10 else 1
-        initial = (str(int(self.junctions[0])) + spacesNeededLeft * " " + "   " + str(self.blue_stack_one) + " " + str(
-            self.red_stack_one) + spacesNeededRight * " " + "   " + str(int(self.junctions[1])) + "\n" +
-                   spacesNeededLeft * " " + "_ _ _ _ _ _" + spacesNeededRight * " " + "\n" +
-                   spacesNeededLeft * " " + " G L G L G " + spacesNeededRight * " " + "\n" +
-                   spacesNeededLeft * " " + "_ _ _ _ _ _" + spacesNeededRight * " " + "\n" +
-                   spacesNeededLeft * " " + " L M H M L " + spacesNeededRight * " " + "\n" +
-                   spacesNeededLeft * " " + "_ _ _ _ _ _" + spacesNeededRight * " " + "\n" +
-                   str(self.blue_substation) + " G H G H G " + str(self.red_substation) + "\n" +
-                   spacesNeededLeft * " " + "_ _ _ _ _ _" + spacesNeededRight * " " + "\n" +
-                   spacesNeededLeft * " " + " L M H M L " + spacesNeededRight * " " + "\n" +
-                   spacesNeededLeft * " " + "_ _ _ _ _ _" + spacesNeededRight * " " + "\n" +
-                   spacesNeededLeft * " " + " G L G L G " + spacesNeededRight * " " + "\n" +
-                   spacesNeededLeft * " " + "_ _ _ _ _ _" + spacesNeededRight * " " + "\n" +
-                   str(int(self.junctions[2])) + spacesNeededLeft * " " + "   " + str(self.blue_stack_two) + " " + str(
-                    self.red_stack_two) + spacesNeededRight * " " + "   " + str(int(self.junctions[3])))
+        return {"observation": tuple(current_obs), "action_mask": self.action_masks[botName]}
 
-        for bot in self.bots:
-            box = coordsToBox(self.bots[bot]["x"], self.bots[bot]["y"])
-            box_x, box_y = boxToCoords(box)
-            x = box_x * 2 + spacesNeededLeft
-            y = box_y * 2 + 1
-            ind = y * (12 + spacesNeededRight + spacesNeededLeft) + x
-            toPut = "R" if self.bots[bot]["team"] == "red" else "B"
-            initial = initial[:ind] + toPut + initial[ind + 1:]
-        return initial
+    def render(self):
+
+        print("CUR TIME:" +  str(self.timeElapsed))
+        if (self.render_mode == "debug"):
+            print("ACTIONS FOR FOLLOWING STATE: " + str(self.actions))
+            print("STATE OF RED_1 FOR GRAPH BELOW: " + str(self.bots["red_1"]))
+            print("STATE OF RED_2 FOR GRAPH BELOW: " + str(self.bots["red_2"]))
+            spacesNeededLeft = 2 if self.blue_substation >= 10 else 1
+            spacesNeededRight = 2 if self.red_substation >= 10 else 1
+            initial = (str(int(self.junctions[0])) + spacesNeededLeft * " " + "   " + str(self.blue_stack_one) + " " + str(
+                self.red_stack_one) + spacesNeededRight * " " + "   " + str(int(self.junctions[1])) + "\n" +
+                       spacesNeededLeft * " " + "_ _ _ _ _ _" + spacesNeededRight * " " + "\n" +
+                       spacesNeededLeft * " " + " G L G L G " + spacesNeededRight * " " + "\n" +
+                       spacesNeededLeft * " " + "_ _ _ _ _ _" + spacesNeededRight * " " + "\n" +
+                       spacesNeededLeft * " " + " L M H M L " + spacesNeededRight * " " + "\n" +
+                       spacesNeededLeft * " " + "_ _ _ _ _ _" + spacesNeededRight * " " + "\n" +
+                       str(self.blue_substation) + " G H G H G " + str(self.red_substation) + "\n" +
+                       spacesNeededLeft * " " + "_ _ _ _ _ _" + spacesNeededRight * " " + "\n" +
+                       spacesNeededLeft * " " + " L M H M L " + spacesNeededRight * " " + "\n" +
+                       spacesNeededLeft * " " + "_ _ _ _ _ _" + spacesNeededRight * " " + "\n" +
+                       spacesNeededLeft * " " + " G L G L G " + spacesNeededRight * " " + "\n" +
+                       spacesNeededLeft * " " + "_ _ _ _ _ _" + spacesNeededRight * " " + "\n" +
+                       str(int(self.junctions[2])) + spacesNeededLeft * " " + "   " + str(self.blue_stack_two) + " " + str(
+                        self.red_stack_two) + spacesNeededRight * " " + "   " + str(int(self.junctions[3])))
+
+            for bot in self.bots:
+                box = coordsToBox(self.bots[bot]["x"], self.bots[bot]["y"])
+                box_x, box_y = boxToCoords(box)
+                x = box_x * 2 + spacesNeededLeft
+                y = box_y * 2 + 1
+                ind = y * (12 + spacesNeededRight + spacesNeededLeft) + x
+                toPut = "R" if self.bots[bot]["team"] == "red" else "B"
+                initial = initial[:ind] + toPut + initial[ind + 1:]
+
 
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent):
-        return MultiDiscrete([3]*29+[242,11,2,30,7,6,6,4,2,2,6,6,4,2,2,6,6,4,2,2,6,6,4,2,2,40,40,25,25,25,25,21,21,6,6,6,6,2,2,2,2])
+        return self.observation_spaces[agent]
 
     #@functools.lru_cache(maxsize=None)
     def action_space(self, agent):
 
         return self.action_spaces[agent]
 
+    def set_action_space_size(self, agent, size):#sets the "size" by masking
+        for i in range(size, 29):
+            self.action_masks[agent][i] = 0
 
 
-from pettingzoo.test import parallel_api_test  # noqa: E402
+
+
+from pettingzoo.test import parallel_api_test
 
 if __name__ == "__main__":
     parallel_api_test(Powerplayer(), num_cycles=1_000_000)
+
+
+
+
+
+
+
+# import gym
+# import torch
+# from tianshou.data import Collector, VectorReplayBuffer
+# from tianshou.env import DummyVectorEnv
+# from tianshou.env.pettingzoo_env import PettingZooEnv
+# from tianshou.policy import BasePolicy, DQNPolicy, MultiAgentPolicyManager, RandomPolicy, PPOPolicy
+# from tianshou.trainer import offpolicy_trainer
+# from tianshou.utils.net.common import Net
+# from typing import Optional, Tuple
+#
+# from copy import deepcopy
+#
+# from pettingzoo.utils import wrappers
+#
+# from tianshou.data import Collector
+# from tianshou.env import DummyVectorEnv
+# from tianshou.policy import RandomPolicy, MultiAgentPolicyManager
+# from pettingzoo.utils.conversions import parallel_wrapper_fn, parallel_to_aec
+#
+# import argparse
+#
+#
+# # agents should be wrapped into one policy,
+# # which is responsible for calling the acting agent correctly
+# # here we use two random agents
+#
+# def get_parser() -> argparse.ArgumentParser:
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument('--seed', type=int, default=1626)
+#     parser.add_argument('--eps-test', type=float, default=0.05)
+#     parser.add_argument('--eps-train', type=float, default=0.1)
+#     parser.add_argument('--buffer-size', type=int, default=20000)
+#     parser.add_argument('--lr', type=float, default=1e-4)
+#     parser.add_argument(
+#         '--gamma', type=float, default=0.9, help='a smaller gamma favors earlier win'
+#     )
+#     parser.add_argument('--n-step', type=int, default=3)
+#     parser.add_argument('--target-update-freq', type=int, default=320)
+#     parser.add_argument('--epoch', type=int, default=50)
+#     parser.add_argument('--step-per-epoch', type=int, default=1000)
+#     parser.add_argument('--step-per-collect', type=int, default=10)
+#     parser.add_argument('--update-per-step', type=float, default=0.1)
+#     parser.add_argument('--batch-size', type=int, default=64)
+#     parser.add_argument(
+#         '--hidden-sizes', type=int, nargs='*', default=[128, 128, 128, 128]
+#     )
+#     parser.add_argument('--training-num', type=int, default=10)
+#     parser.add_argument('--test-num', type=int, default=10)
+#     parser.add_argument('--logdir', type=str, default='log')
+#     parser.add_argument('--render', type=float, default=0.1)
+#     parser.add_argument(
+#         '--win-rate',
+#         type=float,
+#         default=0.6,
+#         help='the expected winning rate: Optimal policy can get 0.7'
+#     )
+#     parser.add_argument(
+#         '--watch',
+#         default=False,
+#         action='store_true',
+#         help='no training, '
+#              'watch the play of pre-trained models'
+#     )
+#     parser.add_argument(
+#         '--agent-id',
+#         type=int,
+#         default=2,
+#         help='the learned agent plays as the'
+#              ' agent_id-th player. Choices are 1 and 2.'
+#     )
+#     parser.add_argument(
+#         '--resume-path',
+#         type=str,
+#         default='',
+#         help='the path of agent pth file '
+#              'for resuming from a pre-trained agent'
+#     )
+#     parser.add_argument(
+#         '--opponent-path',
+#         type=str,
+#         default='',
+#         help='the path of opponent agent pth file '
+#              'for resuming from a pre-trained agent'
+#     )
+#     return parser
+#
+# def get_args() -> argparse.Namespace:
+#     parser = get_parser()
+#     return parser.parse_known_args()[0]
+# def get_env(render_mode=None):
+#     return PettingZooEnv(Powerplayer.env(render_mode=render_mode))
+# def get_agents(
+#     args: argparse.Namespace = get_args(),
+#     agent_learn: Optional[BasePolicy] = None,
+#     agent_opponent: Optional[BasePolicy] = None,
+#     optim: Optional[torch.optim.Optimizer] = None,
+# ) -> Tuple[BasePolicy, torch.optim.Optimizer, list]:
+#     env = get_env()
+#     observation_space = env.observation_space['observation'] if isinstance(
+#         env.observation_space, gym.spaces.Dict
+#     ) else env.observation_space
+#     args.state_shape = observation_space.shape
+#     args.action_shape = env.action_space.shape
+#     args.device = 'cuda'
+#     if agent_learn is None:
+#         # model
+#         net = Net(
+#             args.state_shape,
+#             args.action_shape,
+#             hidden_sizes=args.hidden_sizes,
+#             device=args.device
+#         ).to(args.device)
+#         if optim is None:
+#             optim = torch.optim.Adam(net.parameters(), lr=args.lr)
+#         agent_learn = DQNPolicy(
+#             net,
+#             optim,
+#             args.gamma,
+#             args.n_step,
+#             target_update_freq=args.target_update_freq
+#         )
+#         if args.resume_path:
+#             agent_learn.load_state_dict(torch.load(args.resume_path))
+#
+#     if agent_opponent is None:
+#         if args.opponent_path:
+#             agent_opponent = deepcopy(agent_learn)
+#             agent_opponent.load_state_dict(torch.load(args.opponent_path))
+#         else:
+#             agent_opponent = RandomPolicy()
+#
+#     if args.agent_id == 1:
+#         agents = [agent_learn, agent_learn, agent_opponent, agent_opponent]
+#     else:
+#         agents = [agent_opponent, agent_opponent, agent_learn, agent_learn]
+#     policy = MultiAgentPolicyManager(agents, env)
+#     return policy, optim, env.agents
+#
+#
+#
+#
+# import os
+#
+#
+# def train_agent(
+#     args: argparse.Namespace = get_args(),
+#     agent_learn: Optional[BasePolicy] = None,
+#     agent_opponent: Optional[BasePolicy] = None,
+#     optim: Optional[torch.optim.Optimizer] = None,
+# ) -> Tuple[dict, BasePolicy]:
+#
+#     # ======== environment setup =========
+#     train_envs = DummyVectorEnv([get_env for _ in range(args.training_num)])
+#     test_envs = DummyVectorEnv([get_env for _ in range(args.test_num)])
+#     # seed
+#     np.random.seed(args.seed)
+#     torch.manual_seed(args.seed)
+#     train_envs.seed(args.seed)
+#     test_envs.seed(args.seed)
+#
+#     # ======== agent setup =========
+#     policy, optim, agents = get_agents(
+#         args, agent_learn=agent_learn, agent_opponent=agent_opponent, optim=optim
+#     )
+#
+#     # ======== collector setup =========
+#     train_collector = Collector(
+#         policy,
+#         train_envs,
+#         VectorReplayBuffer(args.buffer_size, len(train_envs)),
+#         exploration_noise=True
+#     )
+#     test_collector = Collector(policy, test_envs, exploration_noise=True)
+#     # policy.set_eps(1)
+#     train_collector.collect(n_step=args.batch_size * args.training_num)
+#
+#     # ======== callback functions used during training =========
+#     def save_best_fn(policy):
+#         if hasattr(args, 'model_save_path'):
+#             model_save_path = args.model_save_path
+#         else:
+#             model_save_path = os.path.join(
+#                 args.logdir, 'tic_tac_toe', 'dqn', 'policy.pth'
+#             )
+#         torch.save(
+#             policy.policies[agents[args.agent_id - 1]].state_dict(), model_save_path
+#         )
+#
+#     def stop_fn(mean_rewards):
+#         return mean_rewards >= args.win_rate
+#
+#     def train_fn(epoch, env_step):
+#         policy.policies[agents[args.agent_id - 1]].set_eps(args.eps_train)
+#
+#     def test_fn(epoch, env_step):
+#         policy.policies[agents[args.agent_id - 1]].set_eps(args.eps_test)
+#
+#     def reward_metric(rews):
+#         return rews[:, args.agent_id - 1]
+#
+#     # trainer
+#     result = offpolicy_trainer(
+#         policy,
+#         train_collector,
+#         test_collector,
+#         args.epoch,
+#         args.step_per_epoch,
+#         args.step_per_collect,
+#         args.test_num,
+#         args.batch_size,
+#         train_fn=train_fn,
+#         test_fn=test_fn,
+#         stop_fn=stop_fn,
+#         save_best_fn=save_best_fn,
+#         update_per_step=args.update_per_step,
+#         test_in_train=False,
+#         reward_metric=reward_metric
+#     )
+#
+#     return result, policy.policies[agents[args.agent_id - 1]]
+#
+# # ======== a test function that tests a pre-trained agent ======
+# def watch(
+#     args: argparse.Namespace = get_args(),
+#     agent_learn: Optional[BasePolicy] = None,
+#     agent_opponent: Optional[BasePolicy] = None,
+# ) -> None:
+#     env = get_env(render_mode="human")
+#     env = DummyVectorEnv([lambda: env])
+#     policy, optim, agents = get_agents(
+#         args, agent_learn=agent_learn, agent_opponent=agent_opponent
+#     )
+#     policy.eval()
+#     policy.policies[agents[args.agent_id - 1]].set_eps(args.eps_test)
+#     collector = Collector(policy, env, exploration_noise=True)
+#     result = collector.collect(n_episode=1, render=args.render)
+#     rews, lens = result["rews"], result["lens"]
+#     print(f"Final reward: {rews[:, args.agent_id - 1].mean()}, length: {lens.mean()}")
+#
+# # train the agent and watch its performance in a match!
+# args = get_args()
+# result, agent = train_agent(args)
+# watch(args, agent)
+
+
+

@@ -1,138 +1,234 @@
-import functools
 import random
-from copy import copy
 
+from gym.spaces import Discrete, Box
+from gym import Env
+from ray.rllib.env.multi_agent_env import MultiAgentEnv
 import numpy as np
-from gymnasium.spaces import Discrete, MultiDiscrete
-
-from pettingzoo.utils.env import ParallelEnv
 
 
-class CustomEnvironment(ParallelEnv):
-    def __init__(self):
-        self.escape_y = None
-        self.escape_x = None
-        self.guard_y = None
-        self.guard_x = None
-        self.prisoner_y = None
-        self.prisoner_x = None
-        self.timestep = None
-        self.possible_agents = ["prisoner", "guard"]
+class TicTacToeMultiEnv(MultiAgentEnv):
+    """Multi-agent environment for tic tac toe."""
 
-    def reset(self, seed=None, return_info=False, options=None):
-        self.agents = ["prisoner", "guard"]
-        self.timestep = 0
+    EMPTY_SYMBOL = 0
+    X_SYMBOL = 1
+    O_SYMBOL = 2
+    SYMBOL_MAP = {
+        X_SYMBOL: 'X',
+        O_SYMBOL: 'O',
+        EMPTY_SYMBOL: '.',
+    }
+    PLAYER_X_ID = 'player_' + SYMBOL_MAP[X_SYMBOL]
+    PLAYER_O_ID = 'player_' + SYMBOL_MAP[O_SYMBOL]
+    PLAYERS = [PLAYER_X_ID, PLAYER_O_ID]
 
-        self.prisoner_x = 0
-        self.prisoner_y = 0
+    NUMBER_FIELDS = 9
+    BOARD_WIDTH = 3
 
-        self.guard_x = 7
-        self.guard_y = 7
+    # Extend space with 1 so a player can also perform no move at all.
+    ACTION_SPACE_SIZE = NUMBER_FIELDS + 1
+    WAIT_MOVE = ACTION_SPACE_SIZE - 1
 
-        self.escape_x = random.randint(2, 5)
-        self.escape_y = random.randint(2, 5)
+    # Extend space with 2 so we can encode:
+    # - Whether the user is X or O.
+    # - Whether the next turn is X or O.
+    OBSERVATION_SPACE_SIZE = NUMBER_FIELDS + 2
+    USER_SYMBOL_INDEX = NUMBER_FIELDS + 1
+    USER_TURN_INDEX = NUMBER_FIELDS
 
-        observations = {
-            a: (
-                self.prisoner_x + 7 * self.prisoner_y,
-                self.guard_x + 7 * self.guard_y,
-                self.escape_x + 7 * self.escape_y,
-            )
-            for a in self.agents
+    ACTION_SPACE = Discrete(ACTION_SPACE_SIZE)
+    OBSERVATION_SPACE = Box(0, 2, [OBSERVATION_SPACE_SIZE])
+
+    LOSE_REWARD = -10
+    WIN_REWARD = 10
+    DRAW_REWARD = -1
+
+    BAD_MOVE_REWARD = -1
+    GOOD_MOVE_REWARD = 0
+
+    def __init__(self, config):
+        self.action_space = self.ACTION_SPACE
+        self.observation_space = self.OBSERVATION_SPACE
+        self.turn = random.choice([self.X_SYMBOL, self.O_SYMBOL])
+        self.reset()
+        self.history = []
+        self.verbose = False
+
+    def reset(self):
+        self._init_board()
+        self.history = []
+        self._save_board()
+        return self._obs()
+
+    def set_verbose(self):
+        self.verbose = True
+
+    def step(self, action: dict):
+        rew, invalid = self._action_rewards(action)
+
+        if invalid:
+            return self._obs(), rew, self._done(False), {}
+
+        self._perform_actions(action)
+        done = self._is_done()
+
+        if done:
+            for player_id in rew:
+                rew[player_id] = self._evaluate_board(player_id)
+
+        self._change_turn()
+        self._save_board()
+        self._print_if_verbose(done, rew)
+        return self._obs(), rew, self._done(done), {}
+
+    def _is_done(self):
+        has_winner = self._get_winner() is not None
+        board_full = self._board_is_full()
+        return has_winner or board_full
+
+    def _obs(self):
+        return {
+            self.X_SYMBOL: np.array(self.board + [self.turn, self.X_SYMBOL]),
+            self.O_SYMBOL: np.array(self.board + [self.turn, self.O_SYMBOL])
         }
-        return observations
 
-    def step(self, actions):
-        # Execute actions
-        self.render()
-        prisoner_action = actions["prisoner"]
-        guard_action = actions["guard"]
+    def _done(self, done):
+        return {self.X_SYMBOL: done, self.O_SYMBOL: done, '__all__': done}
 
-        if prisoner_action == 0 and self.prisoner_x > 0:
-            self.prisoner_x -= 1
-        elif prisoner_action == 1 and self.prisoner_x < 6:
-            self.prisoner_x += 1
-        elif prisoner_action == 2 and self.prisoner_y > 0:
-            self.prisoner_y -= 1
-        elif prisoner_action == 3 and self.prisoner_y < 6:
-            self.prisoner_y += 1
+    def _action_rewards(self, action):
+        rew = {}
+        invalid = False
+        for player_id, player_action in action.items():
+            if not self._valid_action(player_action, player_id):
+                rew[player_id] = self.BAD_MOVE_REWARD
+                invalid = True
+            else:
+                rew[player_id] = self.GOOD_MOVE_REWARD
 
-        if guard_action == 0 and self.guard_x > 0:
-            self.guard_x -= 1
-        elif guard_action == 1 and self.guard_x < 6:
-            self.guard_x += 1
-        elif guard_action == 2 and self.guard_y > 0:
-            self.guard_y -= 1
-        elif guard_action == 3 and self.guard_y < 6:
-            self.guard_y += 1
+        return rew, invalid
 
-        # Check termination conditions
-        terminations = {a: False for a in self.agents}
-        rewards = {a: 0 for a in self.agents}
-        if self.prisoner_x == self.guard_x and self.prisoner_y == self.guard_y:
-            rewards = {"prisoner": -1, "guard": 1}
-            terminations = {a: True for a in self.agents}
+    def _valid_action(self, action, player_id):
+        self._validate_action_space(action)
 
+        # Waiting while it's the players turn.
+        if self.turn == player_id and action == self.WAIT_MOVE:
+            return False
 
+        # Playing while it's not the players turn.
+        if self.turn != player_id and action != self.WAIT_MOVE:
+            return False
 
-        elif self.prisoner_x == self.escape_x and self.prisoner_y == self.escape_y:
-            rewards = {"prisoner": 1, "guard": -1}
-            terminations = {a: True for a in self.agents}
+        # Trying to place on a filled field.
+        if self._field_is_filled(action):
+            return False
 
+        return True
 
+    def _perform_actions(self, actions):
+        for player_id, action in actions.items():
+            if action != self.WAIT_MOVE:
+                self.board[action] = player_id
 
+    def _print_if_verbose(self, done, rew):
+        if self.verbose:
+            self._print_board(self.board)
+            print(f"\n\n-----|{done}|--|{rew}|-----")
 
-        # Check truncation conditions (overwrites termination conditions)
-        observations = {
-            a: (
-                self.prisoner_x + 7 * self.prisoner_y,
-                self.guard_x + 7 * self.guard_y,
-                self.escape_x + 7 * self.escape_y,
+    def _validate_action_space(self, action):
+        if action > self.ACTION_SPACE_SIZE:
+            raise ValueError(
+                f"The action integer must be =< {self.ACTION_SPACE_SIZE}, got: {action}"
             )
-            for a in self.agents
-        }
-        infos = {a: {} for a in self.agents}
-        truncations = {a: False for a in self.agents}
-        if self.timestep > 100:
-            rewards = {"prisoner": 0, "guard": 0}
-            truncations = {"prisoner": True, "guard": True}
 
-        if(truncations["prisoner"] or terminations["prisoner"]):
-            self.agents = []
-        self.timestep += 1
+    def _save_board(self):
+        self.history.append(self.board.copy())
 
-        # Get observations
+    def _get_winner(self):
+        horizontal_groups = [self.board[0:3], self.board[3:6], self.board[6:9]]
+        vertical_groups = [[self.board[0], self.board[3], self.board[6]],
+                           [self.board[1], self.board[4], self.board[7]],
+                           [self.board[2], self.board[5], self.board[8]]]
+        diagonal_groups = [[self.board[0], self.board[4], self.board[8]],
+                           [self.board[2], self.board[4], self.board[6]]]
+        for group in (horizontal_groups + vertical_groups + diagonal_groups):
+            if group.count(self.X_SYMBOL) == self.BOARD_WIDTH:
+                return self.X_SYMBOL
+            if group.count(self.O_SYMBOL) == self.BOARD_WIDTH:
+                return self.O_SYMBOL
+
+    def _evaluate_board(self, player_id):
+        winner = self._get_winner()
+
+        if winner == None:
+            return self.DRAW_REWARD
+        if player_id == winner:
+            return self.WIN_REWARD
+        return self.LOSE_REWARD
+
+    def _print_board(self, board):
+        for i, field in enumerate(board):
+            if i % 3 == 0:
+                print('')
+            print(self.SYMBOL_MAP[field], end='')
+
+    def _empty_fields(self):
+        return [i for i in range(self.NUMBER_FIELDS) if self.board[i] is
+                self.EMPTY_SYMBOL]
+
+    def _field_is_filled(self, field_index):
+        if field_index == self.WAIT_MOVE:
+            return False
+        return self.board[field_index] != self.EMPTY_SYMBOL
+
+    def _board_is_full(self):
+        return len(self._empty_fields()) == 0
+
+    def _init_board(self):
+        self.board = [self.EMPTY_SYMBOL for _ in range(self.NUMBER_FIELDS)]
+
+    def _print_history(self):
+        for i, board in enumerate(self.history):
+            print(f"\n\n---ROUND-{i}---")
+            self._print_board(board)
+        print("\nSCORE: " + str(self._evaluate_board()))
+
+    def _change_turn(self):
+        if self.turn == self.X_SYMBOL:
+            self.turn = self.O_SYMBOL
+        else:
+            self.turn = self.X_SYMBOL
 
 
-        # Get dummy infos (not used in this example)
+import ray.rllib.agents
+from ray.rllib.agents.registry import get_agent_class
 
-        print(self.timestep)
-        return observations, rewards, terminations, truncations, infos
+ray.init()
 
-    def render(self):
-        grid = [['0','0','0','0','0','0','0','0'],
-                ['0','0','0','0','0','0','0','0'],
-                ['0','0','0','0','0','0','0','0'],
-                ['0','0','0','0','0','0','0','0'],
-                ['0','0','0','0','0','0','0','0'],
-                ['0','0','0','0','0','0','0','0'],
-                ['0','0','0','0','0','0','0','0'],
-                ['0','0','0','0','0','0','0','0']]
-        grid[self.prisoner_y][self.prisoner_x] = "P"
-        grid[self.guard_y][self.guard_x] = "G"
-        grid[self.escape_y][self.escape_x] = "E"
-        print(grid)
+trainer = 'PPO'
+trained_policy = trainer + '_policy'
 
-    @functools.lru_cache(maxsize=None)
-    def observation_space(self, agent):
-        return MultiDiscrete([7 * 7 - 1] * 3)
+def policy_mapping_fn(agent_id):
+    mapping = {TicTacToeMultiEnv.O_SYMBOL: trained_policy,
+               TicTacToeMultiEnv.X_SYMBOL: "heuristic"}
+    return mapping[agent_id]
 
-    @functools.lru_cache(maxsize=None)
-    def action_space(self, agent):
-        return Discrete(4)
+config = {
+    "env": TicTacToeMultiEnv,
+    "multiagent": {
+        "policies_to_train": [trained_policy],
+        "policies": {
+            trained_policy: (None, TicTacToeMultiEnv.OBSERVATION_SPACE,
+                           TicTacToeMultiEnv.ACTION_SPACE, {}),
+        },
+        "policy_mapping_fn": policy_mapping_fn
+    },
+}
 
-from pettingzoo.test import parallel_api_test  # noqa: E402
+cls = get_agent_class(trainer) if isinstance(trainer, str) else trainer
+trainer_obj = cls(config=config)
+env = trainer_obj.workers.local_worker().env
 
-if __name__ == "__main__":
-
-    parallel_api_test(CustomEnvironment(), num_cycles=1000000)
+while True:
+    results = trainer_obj.train()
+    results.pop('config')
+    if results['episodes_total'] > 10000:
+        break
